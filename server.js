@@ -21,7 +21,14 @@ app.get('/', (req, res) => {
 
 app.post('/api/create-order', async (req, res) => {
   try {
-    const { planKey, planLabel, amount, customerName, customerEmail, returnUrl } = req.body;
+    const body = req.body || {};
+    const planLabel = body.planLabel || body.plan || body.planName || '';
+    const planKey = body.planKey || planLabel.toLowerCase().replace(/[^a-z0-9]+/g, '_');
+    const amount = body.amount;
+    const customerName = body.customerName || body.name || 'WapNex User';
+    const customerEmail = body.customerEmail || body.email || '';
+    const returnUrl = body.returnUrl || '';
+
     if (!planLabel || !amount || !customerEmail) {
       return res.status(400).json({ message: 'Plan aur customer email zaroori hai' });
     }
