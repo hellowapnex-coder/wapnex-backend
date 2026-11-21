@@ -1,0 +1,185 @@
+const express = require('express');
+const crypto = require('crypto');
+const cors = require('cors');
+
+const app = express();
+app.use(cors());
+
+app.use('/api/cashfree-webhook', express.raw({ type: 'application/json' }));
+app.use(express.json());
+
+const CASHFREE_APP_ID = process.env.CASHFREE_APP_ID;
+const CASHFREE_SECRET_KEY = process.env.CASHFREE_SECRET_KEY;
+const CASHFREE_BASE_URL = 'https://api.cashfree.com/pg';
+
+const ordersDb = new Map();
+const subscriptionsDb = new Map();
+
+app.get('/', (req, res) => {
+  res.send('WapNex Payment Server is Live!');
+});
+
+app.post('/api/create-order', async (req, res) => {
+  try {
+    const { planKey, planLabel, amount, customerName, customerEmail, returnUrl } = req.body;
+    if (!planLabel || !amount || !customerEmail) {
+      return res.status(400).json({ message: 'Plan aur customer email zaroori hai' });
+    }
+
+    const orderId = 'WPNX_' + Date.now() + '_' + Math.floor(Math.random() * 1000);
+    const cleanReturnBase = String(returnUrl || '').split('?')[0];
+
+    const payload = {
+      order_id: orderId,
+      order_amount: Number(amount),
+      order_currency: 'INR',
+      customer_details: {
+        customer_id: customerEmail.toLowerCase().replace(/[^a-z0-9]/g, '_'),
+        customer_name: customerName || 'WapNex User',
+        customer_email: customerEmail.toLowerCase(),
+        customer_phone: '9999999999'
+      },
+      order_meta: {
+        return_url: `${cleanReturnBase}?order_id={order_id}`,
+        notify_url: `${process.env.BACKEND_PUBLIC_URL}/api/cashfree-webhook`
+      },
+      order_note: planLabel
+    };
+
+    const cfRes = await fetch(`${CASHFREE_BASE_URL}/orders`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-version': '2023-08-01',
+        'x-client-id': CASHFREE_APP_ID,
+        'x-client-secret': CASHFREE_SECRET_KEY
+      },
+      body: JSON.stringify(payload)
+    });
+
+    const cfData = await cfRes.json();
+    if (!cfRes.ok || !cfData.payment_session_id) {
+      return res.status(400).json({ message: cfData.message || 'Cashfree order failed' });
+    }
+
+    ordersDb.set(orderId, {
+      orderId,
+      planKey,
+      planLabel,
+      amount: Number(amount),
+      customerEmail: customerEmail.toLowerCase(),
+      status: 'ACTIVE'
+    });
+
+    return res.json({
+      order_id: orderId,
+      payment_session_id: cfData.payment_session_id
+    });
+  } catch (err) {
+    return res.status(500).json({ message: 'Server error creating order' });
+  }
+});
+
+app.post('/api/cashfree-webhook', (req, res) => {
+  try {
+    const signature = req.headers['x-webhook-signature'];
+    const timestamp = req.headers['x-webhook-timestamp'];
+    const rawBody = req.body.toString('utf8');
+
+    const signedPayload = timestamp + rawBody;
+    const expectedSig = crypto
+      .createHmac('sha256', CASHFREE_SECRET_KEY)
+      .update(signedPayload)
+      .digest('base64');
+
+    if (signature !== expectedSig) {
+      return res.status(401).send('Invalid signature');
+    }
+
+    const event = JSON.parse(rawBody);
+    const orderId = event?.data?.order?.order_id;
+    const paymentStatus = event?.data?.payment?.payment_status;
+    const orderRecord = ordersDb.get(orderId);
+
+    if (orderRecord && paymentStatus === 'SUCCESS') {
+      orderRecord.status = 'PAID';
+      ordersDb.set(orderId, orderRecord);
+      subscriptionsDb.set(orderRecord.customerEmail, {
+        status: 'PAID',
+        planLabel: orderRecord.planLabel,
+        orderId
+      });
+    } else if (orderRecord && (paymentStatus === 'FAILED' || paymentStatus === 'USER_DROPPED')) {
+      orderRecord.status = 'FAILED';
+      ordersDb.set(orderId, orderRecord);
+    }
+
+    return res.status(200).send('OK');
+  } catch (err) {
+    return res.status(400).send('Webhook error');
+  }
+});
+
+app.get('/api/verify-payment', async (req, res) => {
+  try {
+    const orderId = String(req.query.order_id || '').trim();
+    if (!orderId) return res.status(400).json({ status: 'INVALID', message: 'Order ID missing' });
+
+    const localOrder = ordersDb.get(orderId);
+
+    const cfRes = await fetch(`${CASHFREE_BASE_URL}/orders/${encodeURIComponent(orderId)}`, {
+      headers: {
+        'x-api-version': '2023-08-01',
+        'x-client-id': CASHFREE_APP_ID,
+        'x-client-secret': CASHFREE_SECRET_KEY
+      }
+    });
+
+    const cfOrder = await cfRes.json();
+    if (!cfRes.ok) {
+      return res.status(400).json({ status: 'FAILED', message: cfOrder.message || 'Order not found' });
+    }
+
+    if (cfOrder.order_status === 'PAID') {
+      const planLabel = (localOrder && localOrder.planLabel) || cfOrder.order_note || 'Pro - Monthly';
+      const customerEmail = (localOrder && localOrder.customerEmail) || (cfOrder.customer_details && cfOrder.customer_details.customer_email) || '';
+
+      if (localOrder) {
+        localOrder.status = 'PAID';
+        ordersDb.set(orderId, localOrder);
+      }
+      if (customerEmail) {
+        subscriptionsDb.set(customerEmail.toLowerCase(), {
+          status: 'PAID',
+          planLabel,
+          orderId
+        });
+      }
+
+      return res.json({
+        status: 'PAID',
+        orderId,
+        planLabel,
+        customerEmail
+      });
+    }
+
+    return res.json({
+      status: cfOrder.order_status || 'FAILED',
+      orderId,
+      message: 'Payment abhi successful nahi hui hai.'
+    });
+  } catch (err) {
+    return res.status(500).json({ status: 'ERROR', message: 'Verification failed' });
+  }
+});
+
+app.get('/api/subscription', (req, res) => {
+  const email = String(req.query.email || '').trim().toLowerCase();
+  const sub = subscriptionsDb.get(email);
+  if (!sub) return res.json({ status: 'TRIAL' });
+  return res.json(sub);
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`WapNex Payment Server running on port ${PORT}`));
