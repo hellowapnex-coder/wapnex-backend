@@ -33,6 +33,10 @@ app.post('/api/create-order', async (req, res) => {
       return res.status(400).json({ message: 'Plan aur customer email zaroori hai' });
     }
 
+    const rawBackendUrl = String(process.env.BACKEND_PUBLIC_URL || 'https://wapnex-backend.onrender.com').trim();
+    const extractedUrl = (rawBackendUrl.match(/https?:\/\/[^\s\]\)]+/i) || [])[0] || 'https://wapnex-backend.onrender.com';
+    const cleanBackendUrl = extractedUrl.replace(/\/+$/, '');
+
     const orderId = 'WPNX_' + Date.now() + '_' + Math.floor(Math.random() * 1000);
     const cleanReturnBase = String(returnUrl || '').split('?')[0];
 
@@ -48,7 +52,7 @@ app.post('/api/create-order', async (req, res) => {
       },
       order_meta: {
         return_url: `${cleanReturnBase}?order_id={order_id}`,
-        notify_url: `${process.env.BACKEND_PUBLIC_URL}/api/cashfree-webhook`
+        notify_url: `${cleanBackendUrl}/api/cashfree-webhook`
       },
       order_note: planLabel
     };
